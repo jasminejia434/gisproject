@@ -1,0 +1,235 @@
+---
+title: "code"
+author: "Jasmine Jia"
+date: "12/13/2024"
+output: html_document
+---
+
+```{r}
+library(sf)
+library(leaflet)
+library(dplyr)
+
+geojson_file <- "datasets/Parks_and_Recreation_Areas.geojson"
+csv_file <- "datasets/Parks_and_Recreation_Areas.csv"
+
+
+parks_geo <- st_read(geojson_file)
+
+# Calculate centroids of polygons
+parks_geo <- parks_geo %>%
+  mutate(centroid = st_centroid(geometry))
+
+
+parks_data <- read.csv(csv_file)
+
+# Create a leaflet map
+dc_map <- leaflet() %>%
+  addTiles() %>%
+  addCircleMarkers(
+    data = parks_geo,
+    lng = st_coordinates(parks_geo$centroid)[,1], # Longitude
+    lat = st_coordinates(parks_geo$centroid)[,2], # Latitude
+    radius = 5,
+    color = "purple",
+    fill = TRUE,
+    fillOpacity = 0.7,
+    popup = ~NAME # Replace with the appropriate column for park names or details
+  )
+
+
+
+```
+
+```{r}
+library(sf)
+library(tidyverse)
+library(mapview)
+library(htmlwidgets)
+library(RColorBrewer)
+
+
+shapefile_path <- "datasets/ACS_5-Year_Economic_Characteristics_DC_Census_Tract/ACS_5-Year_Economic_Characteristics_DC_Census_Tract.shp"
+demographic_data_path <- "datasets/ACS_5-Year_Economic_Characteristics_DC_Census_Tract.csv"
+
+
+census_tracts <- st_read(shapefile_path)
+demographic_data <- read_csv(demographic_data_path)
+
+# Ensure 'GEOID' is of the same type
+census_tracts <- census_tracts %>%
+  mutate(GEOID = as.character(GEOID))
+
+demographic_data <- demographic_data %>%
+  mutate(GEOID = as.character(GEOID))
+
+# Merge datasets
+merged_data <- census_tracts %>%
+  left_join(demographic_data, by = "GEOID")
+
+
+# Define a custom color palette (lighter colors for higher income)
+income_palette <- colorRampPalette(brewer.pal(9, "YlGnBu"))(100)
+
+# Create a mapview object for median income
+
+map_income <- mapview(
+  merged_data, 
+  zcol = "DP03_0062E.x",  
+  legend = TRUE, 
+  layer.name = "Median Income",
+  col.regions = income_palette  # Apply custom palette
+)
+```
+
+
+
+
+
+```{r}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(spatstat)
+library(mapview)
+library(stars)
+
+census_tracts <- st_read("datasets/ACS_5-Year_Economic_Characteristics_DC_Census_Tract/ACS_5-Year_Economic_Characteristics_DC_Census_Tract.shp")
+parks <- st_read("datasets/Parks_and_Recreation_Areas.geojson")
+
+# Ensure consistent CRS
+census_tracts <- st_transform(census_tracts, crs = 3857)
+parks <- st_transform(parks, crs = 3857)
+
+# Compute Greenspace Percentage
+greenspace <- st_intersection(census_tracts, parks) %>%
+  group_by(GEOID) %>%
+  summarise(total_area = sum(st_area(geometry)), .groups = "drop")
+
+census_tracts <- census_tracts %>%
+  st_join(greenspace, join = st_intersects) %>%
+  mutate(
+    greenspace_pct = ifelse(!is.na(total_area), (total_area / st_area(geometry)) * 100, 0),
+    median_income = as.numeric(DP03_0064E),  
+    poverty_rate = as.numeric(DP03_0134P)   
+  )
+
+# Create a spatial point pattern object for greenspace
+greenspace_ppp <- as.ppp(
+  st_coordinates(st_centroid(census_tracts)), 
+  W = as.owin(st_union(census_tracts))
+)
+
+# Align weights and points
+valid_indices <- !is.na(census_tracts$greenspace_pct)
+greenspace_ppp <- greenspace_ppp[valid_indices]
+weights <- census_tracts$greenspace_pct[valid_indices]
+
+# Compute Greenspace Density
+greenspace_density <- density(greenspace_ppp, weights = weights)
+
+# Plot Greenspace Density
+plot(greenspace_density, main = "Greenspace Density")
+contour(greenspace_density, add = TRUE)
+
+# Moran's I for Spatial Autocorrelation of Poverty Rate
+coords <- st_centroid(st_geometry(census_tracts)) %>%
+  st_coordinates()
+neighbors <- poly2nb(census_tracts, queen = TRUE)
+weights_list <- nb2listw(neighbors, style = "W")
+
+poverty_moran <- moran.test(census_tracts$poverty_rate, weights_list)
+cat("Global Moran's I for Poverty Rate:", poverty_moran$estimate[1], "\n")
+
+# Monte Carlo Simulations for Spatial Pattern Hypothesis Testing
+simulate_morans <- function(observed_values, weights, num_sim = 999) {
+  simulated_I <- replicate(num_sim, {
+    permuted_values <- sample(observed_values)
+    moran(permuted_values, weights, n = length(neighbors), S0 = Szero(weights))$I
+  })
+  simulated_I
+}
+
+simulated_I <- simulate_morans(census_tracts$poverty_rate, weights_list)
+observed_I <- poverty_moran$estimate[1]
+
+# Plot Distribution of Simulated Moran's I
+hist(simulated_I, main = "Monte Carlo Simulations for Moran's I", xlab = "Simulated Moran's I")
+abline(v = observed_I, col = "red", lwd = 2)
+
+# Compute p-value
+p_value <- mean(simulated_I >= observed_I)
+cat("Monte Carlo p-value:", p_value, "\n")
+
+# Accessibility to Parks (Distance to Nearest Park)
+park_centroids <- st_centroid(parks)
+tract_centroids <- st_centroid(census_tracts)
+distances <- st_distance(tract_centroids, park_centroids, by_element = FALSE)
+min_distances <- apply(distances, 1, min, na.rm = TRUE)  # Find nearest park for each tract
+census_tracts <- census_tracts %>%
+  mutate(park_access = 1 / (1 + min_distances))  # Transform distance to accessibility metric
+
+# Spatial Regression Analysis
+model <- lm(
+  greenspace_pct ~ median_income + poverty_rate + park_access,
+  data = census_tracts
+)
+
+# Display Regression Results
+library(stargazer)
+stargazer(
+  model,
+  type = "text",
+  title = "Regression Analysis of Greenspace Accessibility",
+  dep.var.labels = "Greenspace Percentage",
+  covariate.labels = c("Median Income", "Poverty Rate", "Park Accessibility"),
+  omit.stat = c("f", "ser"), no.space = TRUE
+)
+
+```
+```{r}
+stargazer(
+  model,
+  type = "html",
+  title = "Regression Analysis of Greenspace Accessibility",
+  dep.var.labels = "Greenspace Percentage",
+  covariate.labels = c("Median Income", "Poverty Rate", "Park Accessibility"),
+  omit.stat = c("f", "ser"), no.space = TRUE,
+  out = "regression_results.html"
+)
+```
+
+```{r}
+hist(simulated_I,
+     main = "Monte Carlo Simulations for Moran's I",
+     xlab = "Simulated Moran's I",
+     breaks = 30,
+     col = "lightblue",
+     border = "white",
+     xlim = range(c(simulated_I, observed_I)))  # Adjust x-axis to include observed value
+abline(v = observed_I, col = "red", lwd = 2)
+```
+
+```{r}
+# Create neighborhood structure
+neighbors <- poly2nb(census_tracts, queen = TRUE)
+
+# Convert neighbors to spatial weights object
+weights <- nb2listw(neighbors, style = "W")
+
+# Compute Local Moran's I
+local_morans <- localmoran(census_tracts$poverty_rate, weights)
+
+# Add results to the census_tracts dataset
+census_tracts <- census_tracts %>%
+  mutate(local_moran = local_morans[, "Ii"])
+
+# Create the map
+local_moran_map <- mapview(census_tracts, 
+                           zcol = "local_moran", 
+                           legend = TRUE, 
+                           layer.name = "Local Moran's I")
+```
+
+
+

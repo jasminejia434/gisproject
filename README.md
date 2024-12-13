@@ -16,5 +16,6 @@ The Quarto Manuscript folder is in gisproject/gis_manuscript:
 Thank you and let me know if there is any questions!
 
 Best,
+
 Jasmine
 
